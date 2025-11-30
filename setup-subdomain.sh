@@ -1,52 +1,31 @@
 #!/usr/bin/env bash
+# Simple Site Manager (Apache / Nginx)
+# by ChatGPT & Khoirul Anam
+# Versi: 1.0 (rebuild)
 
-# Simple interactive site manager for Apache / Nginx
-# Cocok untuk:
-# - Domain utama (contoh: khoirulanam.web.id)
-# - Subdomain (contoh: sneat.khoirulanam.web.id, portofolio.khoirulanam.web.id)
-# Mendukung:
-# - HTML / PHP (DocumentRoot ke folder)
-# - Reverse proxy (Node.js, n8n, dsb.)
+###########################
+# Helper & util functions #
+###########################
 
-set -e
-
-########################################
-# Helper
-########################################
-
-require_root() {
-  if [[ "$EUID" -ne 0 ]]; then
-    echo "Script ini harus dijalankan sebagai root. Contoh:"
-    echo "  sudo $0"
-    exit 1
+ask_yn() {
+  # Usage: ask_yn "Pesan" default
+  # default: Y atau N (tanpa huruf lain)
+  local prompt default answer
+  default="${2:-N}"
+  if [[ "$default" == "Y" ]]; then
+    prompt=" [Y/n] "
+  else
+    prompt=" [y/N] "
   fi
-}
-
-ask_yes_no() {
-  # usage: ask_yes_no "Pesan" "default"
-  local prompt="$1"
-  local default="${2:-N}" # default N
-  local hint="[y/N]"
-  [[ "$default" == "Y" || "$default" == "y" ]] && hint="[Y/n]"
-
-  read -rp "$prompt $hint: " ans
-  ans="${ans:-$default}"
-  case "$ans" in
-    [Yy]) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-ensure_package() {
-  local pkg="$1"
-  if ! dpkg -s "$pkg" >/dev/null 2>&1; then
-    if ask_yes_no "Paket '$pkg' belum terinstall. Install sekarang?" "N"; then
-      apt-get update
-      apt-get install -y "$pkg"
-    else
-      echo "OK, paket '$pkg' tidak diinstall. Beberapa fitur mungkin tidak jalan."
-    fi
-  fi
+  while true; do
+    read -r -p "$1$prompt" answer
+    answer="${answer:-$default}"
+    case "${answer}" in
+      [Yy]) return 0 ;;
+      [Nn]) return 1 ;;
+      *) echo "Jawaban tidak dikenali. Ketik y atau n." ;;
+    esac
+  done
 }
 
 detect_ip() {
@@ -57,511 +36,532 @@ pause() {
   read -rp "Tekan ENTER untuk lanjut..."
 }
 
-########################################
-# Server detection
-########################################
+######################
+# Webserver handling #
+######################
 
-detect_servers() {
-  HAVE_APACHE=0
-  HAVE_NGINX=0
+WEB=""
+APACHE_CONF_DIR="/etc/apache2/sites-available"
+APACHE_ENABLED_DIR="/etc/apache2/sites-enabled"
+NGINX_CONF_DIR="/etc/nginx/sites-available"
+NGINX_ENABLED_DIR="/etc/nginx/sites-enabled"
 
-  if command -v apache2 >/dev/null 2>&1 || [[ -x /usr/sbin/apache2 ]]; then
-    HAVE_APACHE=1
-  fi
-  if command -v nginx >/dev/null 2>&1 || [[ -x /usr/sbin/nginx ]]; then
-    HAVE_NGINX=1
+detect_web() {
+  if command -v apache2ctl >/dev/null 2>&1; then
+    WEB="apache"
+  elif command -v nginx >/dev/null 2>&1; then
+    WEB="nginx"
+  else
+    WEB=""
   fi
 }
 
-choose_server() {
-  detect_servers
-
-  local choice=""
-  while true; do
-    echo ""
-    echo "Pilih web server yang ingin kamu pakai:"
-    if [[ $HAVE_APACHE -eq 1 ]]; then
-      echo "  1) Apache"
+ensure_package() {
+  local pkg="$1"
+  if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+    echo "Paket $pkg belum terinstall."
+    if ask_yn "Install $pkg sekarang?" "N"; then
+      sudo apt-get update
+      sudo apt-get install -y "$pkg"
     else
-      echo "  1) Apache (belum terinstall)"
+      echo "Lewati install $pkg."
     fi
-    if [[ $HAVE_NGINX -eq 1 ]]; then
-      echo "  2) Nginx"
-    else
-      echo "  2) Nginx (belum terinstall)"
-    fi
-    echo "  0) Batal"
+  fi
+}
 
-    read -rp "Pilihan [1/2/0]: " choice
-    case "$choice" in
+ensure_webserver() {
+  detect_web
+  if [[ -z "$WEB" ]]; then
+    echo "Belum ada Apache2 maupun Nginx di server ini."
+    echo "1) Install Apache2"
+    echo "2) Install Nginx"
+    echo "0) Batal"
+    read -rp "Pilih [1/2/0]: " wchoice
+    case "$wchoice" in
       1)
         ensure_package apache2
-        HAVE_APACHE=1
-        SERVER_CHOICE="apache"
-        break
+        WEB="apache"
         ;;
       2)
         ensure_package nginx
-        HAVE_NGINX=1
-        SERVER_CHOICE="nginx"
-        break
-        ;;
-      0)
-        SERVER_CHOICE=""
-        break
+        WEB="nginx"
         ;;
       *)
-        echo "Pilihan tidak dikenal."
+        echo "Batal."
+        exit 1
         ;;
     esac
-  done
-}
-
-########################################
-# Config path helper
-########################################
-
-get_apache_conf_path() {
-  local domain="$1"
-  echo "/etc/apache2/sites-available/${domain}.conf"
-}
-
-get_nginx_conf_path() {
-  local domain="$1"
-  echo "/etc/nginx/sites-available/${domain}.conf"
-}
-
-########################################
-# Create site
-########################################
-
-create_site() {
-  echo ""
-  echo "=== Buat Site Baru (Domain / Subdomain) ==="
-  echo ""
-  echo "Contoh domain:"
-  echo "  - Domain utama : khoirulanam.web.id"
-  echo "  - Subdomain    : sneat.khoirulanam.web.id"
-  echo ""
-
-  read -rp "Masukkan domain lengkap (wajib, contoh: sneat.khoirulanam.web.id): " DOMAIN
-  if [[ -z "$DOMAIN" ]]; then
-    echo "Domain tidak boleh kosong."
-    return
-  fi
-
-  echo ""
-  echo "Folder website (DocumentRoot) adalah tempat file index.php / index.html kamu."
-  echo "Contoh:"
-  echo "  - /var/www/sneat"
-  echo "  - /var/www/html/sneat"
-  echo ""
-  read -rp "Masukkan path folder website (DocumentRoot): " DOCROOT
-  if [[ -z "$DOCROOT" ]]; then
-    echo "DocumentRoot tidak boleh kosong."
-    return
-  fi
-
-  if [[ ! -d "$DOCROOT" ]]; then
-    if ask_yes_no "Folder '$DOCROOT' belum ada. Buat sekarang?" "Y"; then
-      mkdir -p "$DOCROOT"
-      chown -R www-data:www-data "$DOCROOT"
-    else
-      echo "Batal membuat site karena folder belum ada."
-      return
-    fi
-  fi
-
-  echo ""
-  echo "Pilih mode site:"
-  echo "  1) HTML / PHP biasa (file langsung dari folder DocumentRoot)"
-  echo "  2) Reverse proxy (untuk Node.js, n8n, dsb. di port tertentu)"
-  read -rp "Mode [1/2]: " MODE
-  case "$MODE" in
-    1) SITE_MODE="static" ;;
-    2) SITE_MODE="proxy" ;;
-    *)
-      echo "Pilihan tidak dikenal, default ke mode 'static HTML/PHP'."
-      SITE_MODE="static"
-      ;;
-  esac
-
-  if [[ "$SITE_MODE" == "proxy" ]]; then
-    echo ""
-    echo "Contoh port aplikasi:"
-    echo "  - Node / Express : 3000"
-    echo "  - n8n            : 5678"
-    echo ""
-    read -rp "Masukkan port aplikasi tujuan (contoh 3000): " APP_PORT
-    if [[ -z "$APP_PORT" ]]; then
-      echo "Port tidak boleh kosong."
-      return
-    fi
-  fi
-
-  # pilih server
-  choose_server
-  if [[ -z "$SERVER_CHOICE" ]]; then
-    echo "Tidak ada server yang dipilih. Batal."
-    return
-  fi
-
-  if [[ "$SERVER_CHOICE" == "apache" ]]; then
-    create_site_apache
   else
-    create_site_nginx
+    echo "Terdeteksi web server: $WEB"
   fi
-
-  local IP
-  IP=$(detect_ip)
-  echo ""
-  echo "=== INFO DNS ==="
-  echo "Arahkan DNS A record di Cloudflare / panel domain kamu seperti ini:"
-  echo "  Tipe : A"
-  echo "  Nama : ${DOMAIN} (atau bagian depannya saja jika panel butuh, contoh 'sneat')"
-  echo "  IP   : ${IP}"
-  echo ""
-  echo "Setelah DNS mengarah ke VPS, site bisa diakses via:"
-  echo "  http://${DOMAIN}"
-  echo "Jika ingin HTTPS, jalankan (di VPS):"
-  echo "  sudo certbot --apache  -d ${DOMAIN}    # jika pakai Apache"
-  echo "  sudo certbot --nginx   -d ${DOMAIN}    # jika pakai Nginx"
-  echo ""
 }
 
-create_site_apache() {
-  ensure_package apache2
-
-  local CONF
-  CONF=$(get_apache_conf_path "$DOMAIN")
-
-  # aktifkan modul penting
-  a2enmod rewrite >/dev/null 2>&1 || true
-  if [[ "$SITE_MODE" == "proxy" ]]; then
-    a2enmod proxy proxy_http headers >/dev/null 2>&1 || true
+reload_web() {
+  if [[ "$WEB" == "apache" ]]; then
+    sudo systemctl reload apache2
+  elif [[ "$WEB" == "nginx" ]]; then
+    sudo systemctl reload nginx
   fi
+}
 
-  echo ""
-  echo "Mau aktifkan support PHP-FPM untuk file .php? (butuh php-fpm)"
-  if ask_yes_no "Aktifkan PHP-FPM di Apache untuk site ini?" "N"; then
-    USE_PHPFPM=1
-    # cari socket php-fpm
-    PHPFPM_SOCK=$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1 || true)
-    if [[ -z "$PHPFPM_SOCK" ]]; then
-      echo "Socket php-fpm tidak ditemukan. Pastikan php-fpm sudah diinstall (php8.x-fpm)."
-      echo "Contoh: sudo apt-get install php-fpm"
-      USE_PHPFPM=0
-    else
-      echo "PHP-FPM socket terdeteksi: $PHPFPM_SOCK"
-    fi
+get_conf_path() {
+  local domain="$1"
+  if [[ "$WEB" == "apache" ]]; then
+    echo "$APACHE_CONF_DIR/${domain}.conf"
   else
-    USE_PHPFPM=0
+    echo "$NGINX_CONF_DIR/${domain}.conf"
   fi
+}
 
-  echo "Membuat file config Apache: $CONF"
+enable_site() {
+  local domain="$1"
+  if [[ "$WEB" == "apache" ]]; then
+    sudo a2ensite "${domain}.conf"
+  else
+    sudo ln -sf "$(get_conf_path "$domain")" "$NGINX_ENABLED_DIR/${domain}.conf"
+  fi
+  reload_web
+}
 
-  if [[ "$SITE_MODE" == "static" ]]; then
-    cat >"$CONF" <<EOF
+disable_site() {
+  local domain="$1"
+  if [[ "$WEB" == "apache" ]]; then
+    sudo a2dissite "${domain}.conf" || true
+  else
+    sudo rm -f "$NGINX_ENABLED_DIR/${domain}.conf"
+  fi
+  reload_web
+}
+
+###################
+# Certbot helpers #
+###################
+
+ensure_certbot() {
+  if ! command -v certbot >/dev/null 2>&1; then
+    echo "Certbot belum terinstall."
+    if ask_yn "Install certbot sekarang?" "N"; then
+      if [[ "$WEB" == "apache" ]]; then
+        ensure_package python3-certbot-apache
+      else
+        ensure_package python3-certbot-nginx
+      fi
+    fi
+  fi
+}
+
+obtain_ssl() {
+  local domain="$1"
+  ensure_certbot
+  if ! command -v certbot >/dev/null 2>&1; then
+    echo "Certbot belum tersedia. Lewati SSL."
+    return
+  fi
+  if ask_yn "Ingin mengaktifkan HTTPS (Let's Encrypt) untuk $domain?" "Y"; then
+    if [[ "$WEB" == "apache" ]]; then
+      sudo certbot --apache -d "$domain"
+    else
+      sudo certbot --nginx -d "$domain"
+    fi
+  fi
+}
+
+delete_cert() {
+  local domain="$1"
+  if command -v certbot >/dev/null 2>&1; then
+    echo "Menghapus sertifikat Let's Encrypt (jika ada) untuk $domain ..."
+    sudo certbot delete --cert-name "$domain" >/dev/null 2>&1 || true
+  fi
+}
+
+#########################
+# Template virtual host #
+#########################
+
+create_vhost_file() {
+  local domain="$1"
+  local docroot="$2"
+  local use_php="$3"      # "yes" or "no"
+  local conf
+  conf="$(get_conf_path "$domain")"
+
+  if [[ "$WEB" == "apache" ]]; then
+    sudo tee "$conf" >/dev/null <<EOF
 <VirtualHost *:80>
-    ServerName ${DOMAIN}
-    DocumentRoot ${DOCROOT}
+    ServerName $domain
+    DocumentRoot $docroot
 
-    <Directory ${DOCROOT}>
+    <Directory $docroot>
         AllowOverride All
         Require all granted
     </Directory>
 
-    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
-    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
+    ErrorLog \${APACHE_LOG_DIR}/${domain}_error.log
+    CustomLog \${APACHE_LOG_DIR}/${domain}_access.log combined
 EOF
 
-    if [[ $USE_PHPFPM -eq 1 && -n "$PHPFPM_SOCK" ]]; then
-      cat >>"$CONF" <<EOF
+    if [[ "$use_php" == "yes" ]]; then
+      sudo tee -a "$conf" >/dev/null <<'EOF'
 
-    <FilesMatch "\.php$">
-        SetHandler "proxy:unix:${PHPFPM_SOCK}|fcgi://localhost/"
+    <FilesMatch \.php$>
+        SetHandler "proxy:unix:/run/php/php-fpm.sock|fcgi://localhost/"
     </FilesMatch>
 EOF
+      echo "  (Catatan: sesuaikan path socket PHP-FPM di FilesMatch jika berbeda.)"
     fi
 
-    echo "</VirtualHost>" >>"$CONF"
-
-  else
-    # reverse proxy
-    cat >"$CONF" <<EOF
-<VirtualHost *:80>
-    ServerName ${DOMAIN}
-
-    ProxyPreserveHost On
-    RequestHeader set X-Forwarded-Proto expr=%{REQUEST_SCHEME}
-
-    ProxyPass        /  http://127.0.0.1:${APP_PORT}/
-    ProxyPassReverse /  http://127.0.0.1:${APP_PORT}/
-
-    ErrorLog \${APACHE_LOG_DIR}/${DOMAIN}_error.log
-    CustomLog \${APACHE_LOG_DIR}/${DOMAIN}_access.log combined
+    sudo tee -a "$conf" >/dev/null <<EOF
 </VirtualHost>
 EOF
-  fi
 
-  a2ensite "${DOMAIN}.conf"
-  systemctl reload apache2
-  echo ""
-  echo "Site Apache untuk ${DOMAIN} sudah dibuat dan di-enable."
-}
-
-create_site_nginx() {
-  ensure_package nginx
-
-  local CONF
-  CONF=$(get_nginx_conf_path "$DOMAIN")
-
-  echo ""
-  echo "Kalau kamu pakai PHP dengan Nginx, disarankan pakai PHP-FPM."
-  if ask_yes_no "Aktifkan blok PHP-FPM di Nginx untuk site ini?" "N"; then
-    USE_PHPFPM=1
-    PHPFPM_SOCK=$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1 || true)
-    if [[ -z "$PHPFPM_SOCK" ]]; then
-      echo "Socket php-fpm tidak ditemukan. Pastikan php-fpm sudah diinstall."
-      echo "Contoh: sudo apt-get install php-fpm"
-      USE_PHPFPM=0
-    else
-      echo "PHP-FPM socket terdeteksi: $PHPFPM_SOCK"
-    fi
-  else
-    USE_PHPFPM=0
-  fi
-
-  echo "Membuat file config Nginx: $CONF"
-
-  if [[ "$SITE_MODE" == "static" ]]; then
-    cat >"$CONF" <<EOF
+  else # nginx
+    sudo tee "$conf" >/dev/null <<EOF
 server {
     listen 80;
-    server_name ${DOMAIN};
+    server_name $domain;
 
-    root ${DOCROOT};
+    root $docroot;
     index index.php index.html index.htm;
+
+    access_log /var/log/nginx/${domain}_access.log;
+    error_log /var/log/nginx/${domain}_error.log;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$args;
     }
 EOF
 
-    if [[ $USE_PHPFPM -eq 1 && -n "$PHPFPM_SOCK" ]]; then
-      cat >>"$CONF" <<EOF
+    if [[ "$use_php" == "yes" ]]; then
+      sudo tee -a "$conf" >/dev/null <<'EOF'
 
-    location ~ \.php\$ {
+    location ~ \.php$ {
         include snippets/fastcgi-php.conf;
-        fastcgi_pass unix:${PHPFPM_SOCK};
+        fastcgi_pass unix:/run/php/php-fpm.sock;
     }
 EOF
+      echo "  (Catatan: sesuaikan fastcgi_pass jika socket PHP-FPM kamu beda.)"
     fi
 
-    echo "}" >>"$CONF"
+    sudo tee -a "$conf" >/dev/null <<'EOF'
 
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+  fi
+
+  echo "File config dibuat: $conf"
+}
+
+create_reverse_proxy_vhost() {
+  local domain="$1"
+  local target="$2"
+  local conf
+  conf="$(get_conf_path "$domain")"
+
+  if [[ "$WEB" == "apache" ]]; then
+    sudo tee "$conf" >/dev/null <<EOF
+<VirtualHost *:80>
+    ServerName $domain
+
+    ProxyPreserveHost On
+    ProxyPass / $target/
+    ProxyPassReverse / $target/
+
+    ErrorLog \${APACHE_LOG_DIR}/${domain}_proxy_error.log
+    CustomLog \${APACHE_LOG_DIR}/${domain}_proxy_access.log combined
+</VirtualHost>
+EOF
   else
-    # reverse proxy
-    cat >"$CONF" <<EOF
+    sudo tee "$conf" >/dev/null <<EOF
 server {
     listen 80;
-    server_name ${DOMAIN};
+    server_name $domain;
 
     location / {
-        proxy_pass http://127.0.0.1:${APP_PORT};
+        proxy_pass $target;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
+
+    access_log /var/log/nginx/${domain}_proxy_access.log;
+    error_log /var/log/nginx/${domain}_proxy_error.log;
 }
 EOF
   fi
 
-  ln -sf "$CONF" "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-  nginx -t && systemctl reload nginx
-  echo ""
-  echo "Site Nginx untuk ${DOMAIN} sudah dibuat dan di-enable."
+  echo "File config proxy dibuat: $conf"
 }
 
-########################################
-# List sites
-########################################
+#########################
+# Menu: Create new site #
+#########################
 
-list_sites() {
-  echo ""
-  echo "=== Daftar Site (Apache & Nginx) ==="
-  echo ""
+menu_create_site() {
+  echo "=== Buat site baru (domain / subdomain) ==="
+  echo "Contoh domain: khoirulanam.web.id"
+  echo "Contoh subdomain: profile.khoirulanam.web.id"
+  read -rp "Masukkan nama domain / subdomain: " domain
+  [[ -z "$domain" ]] && { echo "Domain tidak boleh kosong."; return; }
 
-  if [[ -d /etc/apache2/sites-available ]]; then
-    echo "Apache:"
-    ls /etc/apache2/sites-available/*.conf 2>/dev/null | sed 's#.*/##' || echo "  (tidak ada)"
-    echo ""
-  fi
+  echo
+  echo "Contoh folder:"
+  echo "  /var/www/html/profile    (untuk subdomain profile)"
+  echo "  /var/www/wordpress       (untuk WordPress)"
+  read -rp "Masukkan path DocumentRoot (folder web): " docroot
+  [[ -z "$docroot" ]] && { echo "DocumentRoot tidak boleh kosong."; return; }
 
-  if [[ -d /etc/nginx/sites-available ]]; then
-    echo "Nginx:"
-    ls /etc/nginx/sites-available/*.conf 2>/dev/null | sed 's#.*/##' || echo "  (tidak ada)"
-    echo ""
-  fi
-
-  pause
-}
-
-########################################
-# Delete site
-########################################
-
-delete_site() {
-  echo ""
-  echo "=== Hapus Site (Uninstall) ==="
-  echo "Contoh domain: sneat.khoirulanam.web.id"
-  read -rp "Masukkan domain yang ingin dihapus: " DOMAIN
-  if [[ -z "$DOMAIN" ]]; then
-    echo "Domain tidak boleh kosong."
-    return
-  fi
-
-  choose_server
-  if [[ -z "$SERVER_CHOICE" ]]; then
-    echo "Tidak ada server yang dipilih. Batal."
-    return
-  fi
-
-  if [[ "$SERVER_CHOICE" == "apache" ]]; then
-    local CONF
-    CONF=$(get_apache_conf_path "$DOMAIN")
-    if [[ ! -f "$CONF" ]]; then
-      echo "Config Apache tidak ditemukan: $CONF"
-      return
-    fi
-    a2dissite "${DOMAIN}.conf" || true
-    rm -f "$CONF"
-    systemctl reload apache2
-    echo "Site Apache ${DOMAIN} sudah dihapus."
-
-  else
-    local CONF
-    CONF=$(get_nginx_conf_path "$DOMAIN")
-    if [[ ! -f "$CONF" ]]; then
-      echo "Config Nginx tidak ditemukan: $CONF"
-      return
-    fi
-    rm -f "$CONF"
-    rm -f "/etc/nginx/sites-enabled/${DOMAIN}.conf"
-    nginx -t && systemctl reload nginx
-    echo "Site Nginx ${DOMAIN} sudah dihapus."
-  fi
-
-  if ask_yes_no "Hapus juga folder DocumentRoot? (BERBAHAYA, hati-hati)" "N"; then
-    read -rp "Masukkan path folder yang akan dihapus (contoh /var/www/sneat): " FOLDER
-    if [[ -n "$FOLDER" && -d "$FOLDER" ]]; then
-      rm -rf "$FOLDER"
-      echo "Folder $FOLDER sudah dihapus."
+  if [[ ! -d "$docroot" ]]; then
+    echo "Folder $docroot belum ada."
+    if ask_yn "Buat folder $docroot sekarang?" "Y"; then
+      sudo mkdir -p "$docroot"
+      sudo chown -R "$USER":"$USER" "$docroot"
     else
-      echo "Folder tidak ditemukan atau kosong. Tidak dihapus."
+      echo "Batal buat site."
+      return
     fi
+  fi
+
+  local use_php="no"
+  if ask_yn "Apakah site ini memakai PHP (WordPress, Laravel, dll)?" "N"; then
+    use_php="yes"
+    ensure_package php-fpm
+  fi
+
+  create_vhost_file "$domain" "$docroot" "$use_php"
+  enable_site "$domain"
+  echo "Site $domain aktif. Coba buka: http://$domain"
+
+  local ip
+  ip="$(detect_ip)"
+  echo "IP server terdeteksi: $ip"
+  echo "Pastikan di Cloudflare / DNS:"
+  echo "  A $domain → $ip"
+
+  obtain_ssl "$domain"
+}
+
+#########################
+# Menu: Reverse proxy   #
+#########################
+
+menu_reverse_proxy() {
+  echo "=== Buat site Reverse Proxy (Node, n8n, dsb.) ==="
+  read -rp "Masukkan domain / subdomain (contoh: n8n.khoirulanam.web.id): " domain
+  [[ -z "$domain" ]] && { echo "Domain tidak boleh kosong."; return; }
+
+  echo "Masukkan target URL aplikasi (contoh: http://127.0.0.1:5678 atau http://localhost:3000)"
+  read -rp "Target URL: " target
+  [[ -z "$target" ]] && { echo "Target tidak boleh kosong."; return; }
+
+  create_reverse_proxy_vhost "$domain" "$target"
+  enable_site "$domain"
+
+  local ip
+  ip="$(detect_ip)"
+  echo "IP server: $ip"
+  echo "Atur DNS: A $domain → $ip"
+
+  obtain_ssl "$domain"
+}
+
+#########################
+# Menu: List all sites  #
+#########################
+
+menu_list_sites() {
+  echo "=== Daftar site (vhost) ==="
+  if [[ "$WEB" == "apache" ]]; then
+    ls -1 "$APACHE_CONF_DIR"
+  else
+    ls -1 "$NGINX_CONF_DIR"
   fi
 }
 
-########################################
-# Change DocumentRoot
-########################################
+#########################
+# Menu: Uninstall site  #
+#########################
 
-change_docroot() {
-  echo ""
-  echo "=== Ubah DocumentRoot Site ==="
-  echo "Fitur ini hanya aman untuk config yang dibuat oleh script ini."
-  read -rp "Masukkan domain site yang ingin diubah: " DOMAIN
-  if [[ -z "$DOMAIN" ]]; then
-    echo "Domain tidak boleh kosong."
+menu_uninstall_site() {
+  echo "=== Uninstall site ==="
+  read -rp "Masukkan domain / subdomain yang mau dihapus: " domain
+  [[ -z "$domain" ]] && { echo "Tidak boleh kosong."; return; }
+
+  local conf
+  conf="$(get_conf_path "$domain")"
+
+  if [[ ! -f "$conf" ]]; then
+    echo "File config $conf tidak ditemukan."
     return
   fi
 
-  choose_server
-  if [[ -z "$SERVER_CHOICE" ]]; then
-    echo "Tidak ada server yang dipilih. Batal."
+  echo "Akan menghapus site $domain."
+  echo "Config: $conf"
+
+  if ask_yn "Lanjut hapus site ini?" "N"; then
+    disable_site "$domain"
+    sudo rm -f "$conf"
+    echo "Config vhost dihapus."
+
+    if ask_yn "Hapus juga folder DocumentRoot (jika yakin)?" "N"; then
+      # cari DocumentRoot / root dari conf
+      local docroot
+      if [[ "$WEB" == "apache" ]]; then
+        docroot=$(grep -i "DocumentRoot" "$conf" 2>/dev/null | awk '{print $2}' | head -n1)
+      else
+        docroot=$(grep -i "root " "$conf" 2>/dev/null | awk '{print $2}' | sed 's/;//' | head -n1)
+      fi
+      if [[ -n "$docroot" && -d "$docroot" ]]; then
+        echo "Menghapus folder $docroot ..."
+        sudo rm -rf "$docroot"
+      else
+        echo "DocumentRoot tidak ditemukan / folder sudah hilang."
+      fi
+    fi
+
+    delete_cert "$domain"
+    echo "Uninstall selesai."
+  else
+    echo "Batal uninstall."
+  fi
+}
+
+############################
+# Menu: Change DocumentRoot #
+############################
+
+menu_change_docroot() {
+  echo "=== Ubah DocumentRoot site ==="
+  read -rp "Masukkan domain / subdomain: " domain
+  [[ -z "$domain" ]] && { echo "Tidak boleh kosong."; return; }
+
+  local conf current_docroot
+  conf="$(get_conf_path "$domain")"
+
+  if [[ ! -f "$conf" ]]; then
+    echo "Config $conf tidak ditemukan."
     return
   fi
 
-  read -rp "Masukkan DocumentRoot baru (contoh /var/www/html/sneat): " NEWROOT
-  if [[ -z "$NEWROOT" ]]; then
-    echo "DocumentRoot baru tidak boleh kosong."
-    return
+  if [[ "$WEB" == "apache" ]]; then
+    current_docroot=$(grep -i "DocumentRoot" "$conf" | awk '{print $2}' | head -n1)
+  else
+    current_docroot=$(grep -i "root " "$conf" | awk '{print $2}' | sed 's/;//' | head -n1)
   fi
-  if [[ ! -d "$NEWROOT" ]]; then
-    if ask_yes_no "Folder '$NEWROOT' belum ada. Buat sekarang?" "Y"; then
-      mkdir -p "$NEWROOT"
-      chown -R www-data:www-data "$NEWROOT"
+
+  echo "DocumentRoot saat ini: ${current_docroot:-tidak ditemukan}"
+  echo "Contoh baru:"
+  echo "  /var/www/html/profile → /var/www/profile"
+  read -rp "Masukkan DocumentRoot baru: " new_docroot
+  [[ -z "$new_docroot" ]] && { echo "Tidak boleh kosong."; return; }
+
+  if [[ ! -d "$new_docroot" ]]; then
+    if ask_yn "Folder $new_docroot belum ada. Buat sekarang?" "Y"; then
+      sudo mkdir -p "$new_docroot"
+      sudo chown -R "$USER":"$USER" "$new_docroot"
     else
       echo "Batal mengubah DocumentRoot."
       return
     fi
   fi
 
-  if [[ "$SERVER_CHOICE" == "apache" ]]; then
-    local CONF
-    CONF=$(get_apache_conf_path "$DOMAIN")
-    if [[ ! -f "$CONF" ]]; then
-      echo "Config Apache tidak ditemukan: $CONF"
-      return
+  if [[ -n "$current_docroot" && -d "$current_docroot" ]]; then
+    if ask_yn "Pindahkan semua isi dari $current_docroot ke $new_docroot?" "N"; then
+      sudo rsync -a "$current_docroot"/ "$new_docroot"/
+      echo "File telah dipindahkan."
     fi
-    # ganti DocumentRoot dan <Directory ...>
-    sed -i "s#^ *DocumentRoot .*#    DocumentRoot ${NEWROOT}#g" "$CONF"
-    sed -i "s#^ *<Directory .*#    <Directory ${NEWROOT}>#g" "$CONF"
-    systemctl reload apache2
-    echo "DocumentRoot Apache untuk ${DOMAIN} sudah diupdate menjadi: ${NEWROOT}"
-
-  else
-    local CONF
-    CONF=$(get_nginx_conf_path "$DOMAIN")
-    if [[ ! -f "$CONF" ]]; then
-      echo "Config Nginx tidak ditemukan: $CONF"
-      return
-    fi
-    sed -i "s#^ *root .*#    root ${NEWROOT};#g" "$CONF"
-    nginx -t && systemctl reload nginx
-    echo "root Nginx untuk ${DOMAIN} sudah diupdate menjadi: ${NEWROOT}"
   fi
+
+  if [[ "$WEB" == "apache" ]]; then
+    sudo sed -i "s#DocumentRoot $current_docroot#DocumentRoot $new_docroot#g" "$conf"
+  else
+    sudo sed -i "s#root $current_docroot;#root $new_docroot;#g" "$conf"
+  fi
+
+  reload_web
+  echo "DocumentRoot untuk $domain sudah diubah menjadi $new_docroot."
 }
 
-########################################
-# Main menu
-########################################
+###########################
+# Menu: Domain Migrator   #
+###########################
+
+menu_domain_migrator() {
+  echo "=== Migrasi domain (search & replace di file) ==="
+  echo "Ini TIDAK langsung menyentuh database."
+  echo "Untuk WordPress, tetap disarankan pakai WP-CLI search-replace."
+  echo
+  echo "Contoh:"
+  echo "  Domain lama: wordpress.khoirulanam.web.id"
+  echo "  Domain baru: wordpress.khoirulanam.web.id"
+  echo "  Folder     : /var/www/wordpress"
+  read -rp "Masukkan domain lama: " old_domain
+  read -rp "Masukkan domain baru: " new_domain
+  read -rp "Masukkan folder yang ingin di-scan (misal /var/www/wordpress): " folder
+
+  if [[ -z "$old_domain" || -z "$new_domain" || -z "$folder" ]]; then
+    echo "Input tidak boleh kosong."
+    return
+  fi
+  if [[ ! -d "$folder" ]]; then
+    echo "Folder $folder tidak ada."
+    return
+  fi
+
+  echo
+  echo "Ringkasan:"
+  echo "  Ganti '$old_domain' → '$new_domain' di semua file teks di $folder"
+  if ! ask_yn "Lanjut proses? (Backup manual dulu sebelum jalanin!)" "N"; then
+    echo "Batal migrasi."
+    return
+  fi
+
+  sudo grep -rl --exclude-dir=".git" "$old_domain" "$folder" | sudo xargs sed -i "s#$old_domain#$new_domain#g"
+  echo "Search & replace selesai."
+}
+
+############
+# Main menu #
+############
 
 main_menu() {
   while true; do
-    echo ""
-    echo "======================================="
-    echo "  Site Manager (Apache / Nginx)"
-    echo "======================================="
+    echo
+    echo "==================================="
+    echo "   Simple Site Manager (Apache/Nginx)"
+    echo "==================================="
+    echo "Web server aktif : $WEB"
+    echo "IP server        : $(detect_ip)"
+    echo
     echo "1) Buat site baru (domain / subdomain)"
-    echo "2) List semua site"
-    echo "3) Hapus site (uninstall)"
-    echo "4) Ubah DocumentRoot site"
+    echo "2) Migrasi domain (search & replace file)"
+    echo "3) Uninstall site (hapus vhost + opsional folder + certbot)"
+    echo "4) List semua site"
+    echo "5) Ubah DocumentRoot"
+    echo "6) Buat site Reverse Proxy (n8n, Node, dsb.)"
     echo "0) Keluar"
-    echo "---------------------------------------"
-    read -rp "Pilih menu [1-4/0]: " MENU
+    read -rp "Pilih menu [0-6]: " choice
 
-    case "$MENU" in
-      1) create_site ;;
-      2) list_sites ;;
-      3) delete_site ;;
-      4) change_docroot ;;
-      0)
-        echo "Keluar. Bye!"
-        break
-        ;;
-      *)
-        echo "Pilihan tidak dikenal."
-        ;;
+    case "$choice" in
+      1) menu_create_site ;;
+      2) menu_domain_migrator ;;
+      3) menu_uninstall_site ;;
+      4) menu_list_sites ;;
+      5) menu_change_docroot ;;
+      6) menu_reverse_proxy ;;
+      0) echo "Keluar."; break ;;
+      *) echo "Pilihan tidak dikenali." ;;
     esac
+    pause
   done
 }
 
-########################################
-# RUN
-########################################
+################
+# Entry point  #
+################
 
-require_root
+ensure_webserver
 main_menu
